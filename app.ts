@@ -248,6 +248,29 @@ function resolveRef(repo: Repo, ref: string): string | undefined {
   const full = ref.startsWith('refs/') ? ref : `refs/heads/${ref}`;
   return repo.refs.get(full);
 }
+function collectCommitClosure(repo: Repo, commitOids: string[]): Set<string> {
+  // Commits plus their tree closures, WITHOUT following commit parents.
+  // Used for depth-limited fetches: only the depth-limited commits may be sent.
+  const seen = new Set<string>();
+  const stack = [...commitOids];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    seen.add(oid);
+    if (obj.type === 'commit') {
+      stack.push(parseCommit(obj.data).tree);
+    } else if (obj.type === 'tree') {
+      for (const e of parseTree(obj.data)) {
+        if (e.mode !== '160000') stack.push(e.oid);
+      }
+    } else if (obj.type === 'tag') {
+      stack.push(parseTag(obj.data).object);
+    }
+  }
+  return seen;
+}
 function collectReachable(repo: Repo, roots: string[]): Set<string> {
   const seen = new Set<string>();
   const stack = [...roots];
@@ -521,7 +544,7 @@ function bodyObj(v: unknown): Record<string, unknown> {
 function str(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
-function paginate<T>(items: T[], url: URL): { page: T[]; link: string | null } {
+function paginate<T>(items: T[], url: URL, host: string): { page: T[]; link: string | null } {
   const perPageRaw = parseInt(url.searchParams.get('per_page') ?? '30', 10);
   const perPage = Number.isFinite(perPageRaw) && perPageRaw > 0 ? Math.min(perPageRaw, 100) : 30;
   const pageRaw = parseInt(url.searchParams.get('page') ?? '1', 10);
@@ -529,7 +552,9 @@ function paginate<T>(items: T[], url: URL): { page: T[]; link: string | null } {
   const totalPages = Math.max(1, Math.ceil(items.length / perPage));
   const start = (page - 1) * perPage;
   const pageItems = items.slice(start, start + perPage);
-  const origin = `http://entry`;
+  // Link URLs must stay on the entry's own origin (the request's Host), or a
+  // client following rel="next" leaves the origin and fails the check.
+  const origin = `http://${host}`;
   const mk = (p: number): string => {
     const q = new URLSearchParams(url.searchParams);
     q.set('page', String(p));
@@ -665,7 +690,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
   // GET /user/repos
   if (method === 'GET' && segs.length === 2 && segs[0] === 'user' && segs[1] === 'repos') {
     const all = [...repos.values()].filter((r) => r.owner === VIEWER_LOGIN).sort((x, y) => x.seq - y.seq);
-    const { page, link } = paginate(all.map((r) => repoJson(r)), url);
+    const { page, link } = paginate(all.map((r) => repoJson(r)), url, req.headers.host ?? 'entry');
     sendJson(res, 200, page, link ? { link } : {});
     return;
   }
@@ -894,7 +919,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
           if (state !== 'all') list = list.filter((i) => i.state === state);
           const cmp = sort === 'created' ? (a: IssueRec, z: IssueRec) => a.seq - z.seq : (a: IssueRec, z: IssueRec) => a.seq - z.seq;
           list.sort((a, z) => (direction === 'desc' ? -cmp(a, z) : cmp(a, z)));
-          const { page, link } = paginate(list.map((i) => issueJson(repo, i)), url);
+          const { page, link } = paginate(list.map((i) => issueJson(repo, i)), url, req.headers.host ?? 'entry');
           sendJson(res, 200, page, link ? { link } : {});
           return;
         }
@@ -950,7 +975,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
           let list = [...repo.pulls];
           if (state !== 'all') list = list.filter((p) => p.state === state);
           list.sort((a, z) => z.seq - a.seq);
-          const { page, link } = paginate(list.map((p) => pullJson(repo, p)), url);
+          const { page, link } = paginate(list.map((p) => pullJson(repo, p)), url, req.headers.host ?? 'entry');
           sendJson(res, 200, page, link ? { link } : {});
           return;
         }
@@ -1169,7 +1194,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL): P
           const parents = obj && obj.type === 'commit' ? parseCommit(obj.data).parents : [];
           if (parents.some((p) => !commits.has(p))) boundary.push(oid);
         }
-        included = collectReachable(repo, [...commits]);
+        included = collectCommitClosure(repo, [...commits]);
         const delivered = included;
         newShallow = [...new Set([...boundary, ...prevShallow.filter((s) => !delivered.has(s))])];
         unshallow = prevShallow.filter((s) => delivered.has(s) && !newShallow.includes(s));
