@@ -1157,9 +1157,15 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL): P
         else if (t === 'done' || t === 'thin-pack' || t === 'no-progress' || t === 'ofs-delta' || t.startsWith('filter ') || t.startsWith('agent')) { /* ok */ }
       }
       const parts: Buffer[] = [];
-      const wantReach = collectReachable(repo, wants.filter((w) => repo.objects.has(w)));
+      // The full want-closure is only needed when there are haves to ACK or when
+      // the fetch is not depth-limited; shallow clones skip this whole walk.
+      let wantReach: Set<string> | null = null;
+      const getWantReach = (): Set<string> => {
+        if (wantReach === null) wantReach = collectReachable(repo, wants.filter((w) => repo.objects.has(w)));
+        return wantReach;
+      };
       if (haves.length > 0) {
-        const common = haves.filter((h) => repo.objects.has(h) && wantReach.has(h));
+        const common = haves.filter((h) => repo.objects.has(h) && getWantReach().has(h));
         parts.push(pktLine('acknowledgments\n'));
         if (common.length > 0) {
           for (const c of common) parts.push(pktLine(`ACK ${c}\n`));
@@ -1199,9 +1205,8 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL): P
         newShallow = [...new Set([...boundary, ...prevShallow.filter((s) => !delivered.has(s))])];
         unshallow = prevShallow.filter((s) => delivered.has(s) && !newShallow.includes(s));
       } else {
-        const wantReach = collectReachable(repo, wants.filter((w) => repo.objects.has(w)));
         const haveReach = collectReachable(repo, haves.filter((h) => repo.objects.has(h)));
-        included = new Set([...wantReach].filter((o) => !haveReach.has(o)));
+        included = new Set([...getWantReach()].filter((o) => !haveReach.has(o)));
       }
       if (newShallow.length > 0 || unshallow.length > 0) {
         parts.push(pktLine('shallow-info\n'));
