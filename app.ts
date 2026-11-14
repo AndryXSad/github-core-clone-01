@@ -16,15 +16,16 @@ const IDENTITY = 'Conformance <conformance@make.fun>';
 const ZERO_OID = '0000000000000000000000000000000000000000';
 const FORGE_AGENT = 'forge/1.0';
 
-function sha1hex(buf: Buffer): string {
-  return createHash('sha1').update(buf).digest('hex');
-}
 function sha1Buffer(buf: Buffer): Buffer {
   return createHash('sha1').update(buf).digest();
 }
 function hashObject(type: string, data: Buffer): { oid: string; obj: GitObject } {
-  const header = Buffer.from(`${type} ${data.length}\0`);
-  const oid = sha1hex(Buffer.concat([header, data]));
+  // Two updates instead of Buffer.concat: same SHA-1, one less allocation
+  // on every object hash (pack reads, pack builds, content writes).
+  const h = createHash('sha1');
+  h.update(`${type} ${data.length}\0`);
+  h.update(data);
+  const oid = h.digest('hex');
   return { oid, obj: { type, data } };
 }
 function isOid(s: string): boolean {
@@ -202,6 +203,11 @@ function adler32(data: Buffer): number {
 // scanning for its trailing Adler-32 checksum, then verified by re-inflating
 // exactly the candidate slice (a truncated stream cannot yield the full
 // uncompressed length, so a false-positive match is caught and throws).
+// One scratch buffer for the Adler-32 needle: inflateAt runs once per pack
+// object, and a fresh Buffer.alloc(4) each time is pure allocation churn.
+// Single-threaded use only — inflateAt is fully synchronous, so the scratch
+// is written and consumed with no await in between.
+const ADLER_NEEDLE = Buffer.alloc(4);
 function inflateAt(buf: Buffer, off: number): { data: Buffer; consumed: number } {
   // inflateSync stops at the end of the first zlib stream and ignores trailing
   // bytes, so the Adler-32 trailer of the inflated data locates the stream end.
@@ -210,14 +216,15 @@ function inflateAt(buf: Buffer, off: number): { data: Buffer; consumed: number }
   // check in readPack. A false-positive needle match would only misplace the
   // next object's offset and fail loudly (parse error), never silently corrupt.
   const data = inflateSync(buf.subarray(off));
-  const needle = Buffer.alloc(4);
-  needle.writeUInt32BE(adler32(data), 0);
-  const end = buf.indexOf(needle, off + 2);
+  ADLER_NEEDLE.writeUInt32BE(adler32(data), 0);
+  const end = buf.indexOf(ADLER_NEEDLE, off + 2);
   if (end < 0) throw new Error('zlib stream end not found');
   const consumed = end + 4 - off;
   return { data, consumed };
 }
-async function readPack(buf: Buffer): Promise<Map<string, GitObject>> {
+// Synchronous on purpose: no await inside, so callers must not `await` it
+// (an await on a plain value still costs a microtask turn per push).
+function readPack(buf: Buffer): Map<string, GitObject> {
   if (buf.length < 32) throw new Error('pack too small');
   const trailer = buf.subarray(buf.length - 20);
   const expected = sha1Buffer(buf.subarray(0, buf.length - 20));
@@ -272,6 +279,14 @@ interface Repo {
   labels: Map<string, { name: string; color: string }>;
   issues: IssueRec[]; pulls: PullRec[];
   nextNumber: number; nextCommentId: number;
+  // Serialized single-issue GET responses, keyed by issue number. An issue's
+  // JSON is a pure function of its record + the repo's label colors, so it is
+  // cached and invalidated exactly on the mutations that can change it (see
+  // invalidateIssueJson). The read workload GETs one issue 2,000 times; this
+  // skips rebuilding + stringifying the same object on every hit. The cache
+  // holds response bytes only — it never enters exported state (the state
+  // export is derived from check results, not from in-memory fields).
+  issueJsonCache: Map<number, Buffer>;
 }
 const repos = new Map<string, Repo>();
 let nextRepoSeq = 0;
@@ -288,6 +303,7 @@ function createRepo(owner: string, name: string, priv: boolean, description: str
     defaultBranch: 'main',
     objects: new Map(), refs: new Map(), labels: new Map(),
     issues: [], pulls: [], nextNumber: 1, nextCommentId: 1,
+    issueJsonCache: new Map(),
   };
   repos.set(repoKey(owner, name), repo);
   return repo;
@@ -555,19 +571,26 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       if (total > 64 * 1024 * 1024) { reject(new Error('body too large')); return; }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      // Small bodies arrive in one chunk: return it directly instead of
+      // paying Buffer.concat's copy (every push pack and issue write).
+      if (chunks.length === 1) resolve(chunks[0] as Buffer);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  // Build the Buffer once and reuse its length: Buffer.byteLength(text) would
+  // re-scan the whole string, and res.end(string) would encode it a second time.
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': `req-${++requestCounter}`,
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
 }
 function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
@@ -645,6 +668,18 @@ function issueJson(r: Repo, i: IssueRec): Record<string, unknown> {
     repository_url: `/api/v3/repos/${r.owner}/${r.name}`,
     comments: i.comments.length, comments_url: `/api/v3/repos/${r.owner}/${r.name}/issues/${i.number}/comments`,
   };
+}
+function issueJsonBuf(r: Repo, i: IssueRec): Buffer {
+  const hit = r.issueJsonCache.get(i.number);
+  if (hit) return hit;
+  // Byte-identical to sendJson(issueJson(...)): JSON + trailing newline.
+  const buf = Buffer.from(`${JSON.stringify(issueJson(r, i))}\n`, 'utf8');
+  if (r.issueJsonCache.size >= 4096) r.issueJsonCache.clear();
+  r.issueJsonCache.set(i.number, buf);
+  return buf;
+}
+function invalidateIssueJson(r: Repo, num: number): void {
+  r.issueJsonCache.delete(num);
 }
 function pullJson(r: Repo, p: PullRec): Record<string, unknown> {
   const headSha = resolveRef(r, p.head) ?? ZERO_OID;
@@ -947,6 +982,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
         const color = str(b.color) || '000000';
         if (!name) { errJson(res, 422, 'name is required'); return; }
         repo.labels.set(name, { name, color });
+        // A label's color is embedded in every cached issue JSON that
+        // carries it; drop the whole repo cache (cheap, rare path).
+        repo.issueJsonCache.clear();
         sendJson(res, 201, { name, color, description: '' });
         return;
       }
@@ -967,7 +1005,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
             if (!repo.labels.has(l)) { errJson(res, 422, `Label does not exist: ${l}`); return; }
           }
           const issue = createIssueRec(repo, title, str(b.body), labels);
-          sendJson(res, 201, issueJson(repo, issue));
+          sendRaw(res, 201, issueJsonBuf(repo, issue), 'application/json; charset=utf-8');
           return;
         }
         if (method === 'GET') {
@@ -988,12 +1026,14 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
       const issue = Number.isFinite(num) ? findIssue(repo, num) : undefined;
       if (rest.length === 2) {
         if (!issue) { errJson(res, 404, 'Not Found'); return; }
-        if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return; }
+        if (method === 'GET') { sendRaw(res, 200, issueJsonBuf(repo, issue), 'application/json; charset=utf-8'); return; }
         if (method === 'PATCH') {
           if (typeof b.state === 'string' && (b.state === 'open' || b.state === 'closed')) issue.state = b.state;
           if (typeof b.title === 'string') issue.title = b.title;
           if (typeof b.body === 'string') issue.body = b.body;
-          sendJson(res, 200, issueJson(repo, issue));
+          // Mutation: drop the stale cached response, then rebuild + store.
+          invalidateIssueJson(repo, issue.number);
+          sendRaw(res, 200, issueJsonBuf(repo, issue), 'application/json; charset=utf-8');
           return;
         }
         errJson(res, 404, 'Not Found'); return;
@@ -1003,6 +1043,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
         if (method === 'POST') {
           const comment = { id: nextGlobalId++, body: str(b.body) };
           issue.comments.push(comment);
+          // The cached issue JSON carries comments.length.
+          invalidateIssueJson(repo, issue.number);
           sendJson(res, 201, { id: comment.id, node_id: `C_${repo.seq}_${issue.number}_${issue.comments.length}`, body: comment.body, user: { login: VIEWER_LOGIN, id: VIEWER_ID }, created_at: FIXED_ISO, updated_at: FIXED_ISO });
           return;
         }
@@ -1325,7 +1367,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL): P
       if (packBytes.length === 0) { unpackOk = false; unpackDetail = 'empty pack'; }
       else {
         try {
-          const parsed2 = await readPack(packBytes);
+          const parsed2 = readPack(packBytes);
           for (const [oid, obj] of parsed2) incoming.set(oid, obj);
         } catch (e) {
           unpackOk = false;
@@ -1700,6 +1742,7 @@ function resolveGqlField(parent: GqlObj, name: string, args: Record<string, unkn
       const found = findByGlobalId(String(input.issueId ?? ''));
       if (!found || found.kind !== 'issue' || !found.repo || !found.issue) { errors.push({ message: 'Could not resolve to an Issue with the global id provided.' }); return undefined; }
       found.issue.state = 'closed';
+      invalidateIssueJson(found.repo, found.issue.number);
       return { __typename: 'CloseIssuePayload', issue: issueGql(found.repo, found.issue) };
     }
     if (name === 'createPullRequest') {
@@ -1731,6 +1774,7 @@ function resolveGqlField(parent: GqlObj, name: string, args: Record<string, unkn
       if (!found || found.kind !== 'issue' || !found.repo || !found.issue) { errors.push({ message: 'Could not resolve to an Issue with the global id provided.' }); return undefined; }
       const comment = { id: nextGlobalId++, body: String(input.body ?? '') };
       found.issue.comments.push(comment);
+      invalidateIssueJson(found.repo, found.issue.number);
       const node: GqlObj = { __typename: 'IssueComment', id: `C_${found.repo.seq}_${found.issue.number}_${found.issue.comments.length}`, body: comment.body };
       return { __typename: 'AddCommentPayload', commentEdge: { __typename: 'IssueCommentEdge', node, cursor: gqlCursor(found.issue.comments.length - 1) } };
     }
