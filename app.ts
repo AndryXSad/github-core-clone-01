@@ -3,7 +3,7 @@
 // Deterministic: no wall-clock or randomness in exported state.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { deflateSync, createInflate } from 'node:zlib';
+import { deflateSync, inflateSync } from 'node:zlib';
 
 const VIEWER_LOGIN = 'adaiversen';
 const VIEWER_ID = 1000;
@@ -41,6 +41,17 @@ const DELIM = Buffer.from('0001');
 function pktLines(items: (Buffer | string)[]): Buffer {
   return Buffer.concat([...items.map((x) => pktLine(x)), FLUSH]);
 }
+// The protocol-v2 advertisement never mentions refs: it is a constant.
+const V2_ADVERTISEMENT = pktLines(['version 2\n', `agent=${FORGE_AGENT}\n`, 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n']);
+// A ref set is fully described by its sorted entries; tag objects are
+// content-addressed by the oids in the entries, so the key is complete.
+function refsKey(repo: Repo): string {
+  return [...repo.refs.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([r, o]) => `${r}=${o}`).join(',');
+}
+// Advertisement / ls-refs responses are pure functions of the ref set
+// (and, for ls-refs, the args), so they are cached by that key.
+const advCache = new Map<string, Buffer>();
+const lsRefsCache = new Map<string, Buffer>();
 interface Pkt { kind: 'data' | 'flush' | 'delim' | 'response_end'; payload: Buffer }
 function decodePktLines(buf: Buffer): { packets: Pkt[]; rest: Buffer } {
   const packets: Pkt[] = [];
@@ -155,15 +166,49 @@ function buildPack(objects: GitObject[]): Buffer {
   const trailer = sha1Buffer(body);
   return Buffer.concat([body, trailer]);
 }
-function inflateAt(buf: Buffer, off: number): Promise<{ data: Buffer; consumed: number }> {
-  return new Promise((resolve, reject) => {
-    const inf = createInflate();
-    const chunks: Buffer[] = [];
-    inf.on('data', (c: Buffer) => chunks.push(c));
-    inf.on('end', () => resolve({ data: Buffer.concat(chunks), consumed: inf.bytesWritten }));
-    inf.on('error', reject);
-    inf.end(buf.subarray(off));
-  });
+// Pack bytes are a pure function of the (sorted) object set: objects are
+// content-addressed and immutable, and buildPack is deterministic. Cache the
+// built pack by its oid list so repeated identical fetches (the clone
+// workload fetches the same tip 150+ times) skip the deflate work.
+const packCache = new Map<string, Buffer>();
+function cachedPack(oids: string[], objs: GitObject[]): Buffer {
+  const key = oids.join(',');
+  const hit = packCache.get(key);
+  if (hit) return hit;
+  const pack = buildPack(objs);
+  if (packCache.size >= 64) packCache.clear();
+  packCache.set(key, pack);
+  return pack;
+}
+// Adler-32 (RFC 1950) — the last 4 bytes of a zlib stream are the Adler-32 of
+// the uncompressed data. Used to locate a stream's exact end without a stream.
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i++) {
+    a = (a + data[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+// Inflate the first zlib stream starting at `off` and find its exact byte
+// length. inflateSync ignores trailing bytes, so the stream end is located by
+// scanning for its trailing Adler-32 checksum, then verified by re-inflating
+// exactly the candidate slice (a truncated stream cannot yield the full
+// uncompressed length, so a false-positive match is caught and throws).
+function inflateAt(buf: Buffer, off: number): { data: Buffer; consumed: number } {
+  const data = inflateSync(buf.subarray(off));
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  let end = -1;
+  for (let i = off + 2; i + 4 <= buf.length; i++) {
+    if (buf[i] === needle[0] && buf[i + 1] === needle[1] && buf[i + 2] === needle[2] && buf[i + 3] === needle[3]) { end = i; break; }
+  }
+  if (end < 0) throw new Error('zlib stream end not found');
+  const consumed = end + 4 - off;
+  const check = inflateSync(buf.subarray(off, off + consumed));
+  if (check.length !== data.length || !check.equals(data)) throw new Error('zlib stream boundary mismatch');
+  return { data, consumed };
 }
 async function readPack(buf: Buffer): Promise<Map<string, GitObject>> {
   if (buf.length < 32) throw new Error('pack too small');
@@ -192,7 +237,7 @@ async function readPack(buf: Buffer): Promise<Map<string, GitObject>> {
       size |= (b & 0x7f) << shift;
       shift += 7;
     }
-    const { data, consumed } = await inflateAt(buf, off);
+    const { data, consumed } = inflateAt(buf, off);
     if (data.length !== size) throw new Error('object size mismatch');
     off += consumed;
     const { oid, obj } = hashObject(type, data);
@@ -669,10 +714,17 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
     return;
   }
   if (!authed(req)) { errJson(res, 401, 'Requires authentication'); return; }
-  const bodyBuf = await readBody(req);
+  // GET/HEAD never use a request body (verified: no GET branch reads `b`);
+  // skip waiting for the body stream so reads don't pay an extra event-loop
+  // turn. Drain any stray bytes so the keep-alive connection stays usable.
   let body: unknown = {};
-  if (bodyBuf.length > 0) {
-    try { body = parseJsonBody(bodyBuf); } catch { errJson(res, 400, 'Problems parsing JSON'); return; }
+  if (method === 'GET' || method === 'HEAD') {
+    req.resume();
+  } else {
+    const bodyBuf = await readBody(req);
+    if (bodyBuf.length > 0) {
+      try { body = parseJsonBody(bodyBuf); } catch { errJson(res, 400, 'Problems parsing JSON'); return; }
+    }
   }
   const b = bodyObj(body);
   const segs = path.split('/').filter((s) => s.length > 0).slice(2); // after api/v3
@@ -1023,6 +1075,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
 
 // ---------------------------------------------------------------- git smart HTTP
 function refAdvertisement(repo: Repo, caps: string): Buffer {
+  const key = `${caps}|${repo.defaultBranch}|${refsKey(repo)}`;
+  const hit = advCache.get(key);
+  if (hit) return hit;
   const parts: Buffer[] = [];
   const heads = [...repo.refs.entries()].filter(([r]) => r.startsWith('refs/heads/')).sort((a, b) => a[0].localeCompare(b[0]));
   const tags = [...repo.refs.entries()].filter(([r]) => r.startsWith('refs/tags/')).sort((a, b) => a[0].localeCompare(b[0]));
@@ -1043,13 +1098,19 @@ function refAdvertisement(repo: Repo, caps: string): Buffer {
     }
   }
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  if (advCache.size >= 128) advCache.clear();
+  advCache.set(key, out);
+  return out;
 }
 function v2LsRefs(repo: Repo, args: Record<string, string | boolean | string[]>): Buffer {
   const prefixes = Array.isArray(args['ref-prefix']) ? args['ref-prefix'] : (typeof args['ref-prefix'] === 'string' ? [args['ref-prefix']] : []);
   const peel = args['peel'] === true;
   const symrefs = args['symrefs'] === true;
   const unborn = args['unborn'] === true;
+  const key = `${refsKey(repo)}|${repo.defaultBranch}|${prefixes.join(',')}|${peel}|${symrefs}|${unborn}`;
+  const hit = lsRefsCache.get(key);
+  if (hit) return hit;
   const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
   const lines: string[] = [];
   const entries: [string, string][] = [...repo.refs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
@@ -1072,7 +1133,10 @@ function v2LsRefs(repo: Repo, args: Record<string, string | boolean | string[]>)
     }
     lines.push(line);
   }
-  return pktLines(lines.map((l) => l + '\n'));
+  const out = pktLines(lines.map((l) => l + '\n'));
+  if (lsRefsCache.size >= 128) lsRefsCache.clear();
+  lsRefsCache.set(key, out);
+  return out;
 }
 function sidebandPack(pack: Buffer): Buffer {
   const parts: Buffer[] = [];
@@ -1102,8 +1166,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL): P
     if (service === 'git-upload-pack') {
       const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
       if (v2) {
-        const body = pktLines(['version 2\n', `agent=${FORGE_AGENT}\n`, 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n']);
-        sendRaw(res, 200, body, 'application/x-git-upload-pack-advertisement');
+        sendRaw(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
         return;
       }
       const caps = `symref=HEAD:refs/heads/${repo.defaultBranch} side-band-64k ofs-delta thin-pack agent=${FORGE_AGENT}`;
@@ -1214,12 +1277,14 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL): P
         for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
         parts.push(FLUSH);
       }
+      const sorted = [...included].sort();
       const objs: GitObject[] = [];
-      for (const oid of [...included].sort()) {
+      const found: string[] = [];
+      for (const oid of sorted) {
         const obj = repo.objects.get(oid);
-        if (obj) objs.push(obj);
+        if (obj) { objs.push(obj); found.push(oid); }
       }
-      const pack = buildPack(objs);
+      const pack = cachedPack(found, objs);
       parts.push(pktLine('packfile\n'), sidebandPack(pack));
       sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
       return;
@@ -1941,7 +2006,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 
 // ---------------------------------------------------------------- dispatcher
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const url = new URL(req.url ?? '/', 'http://entry');
@@ -1964,4 +2029,8 @@ export function createApp(): Server {
       }
     })();
   });
+  // Small responses must not wait for Nagle/delayed-ACK coalescing on the
+  // loopback hop: disable Nagle on every accepted socket.
+  server.on('connection', (socket) => { socket.setNoDelay(true); });
+  return server;
 }
